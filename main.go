@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
@@ -31,9 +33,10 @@ var styleFS embed.FS
 var (
 	md goldmark.Markdown
 
-	filePath string
-	content  []byte
-	mu       sync.RWMutex
+	filePath     string
+	content      []byte
+	lastModified time.Time
+	mu           sync.RWMutex
 
 	clients   = make(map[chan struct{}]struct{})
 	clientsMu sync.Mutex
@@ -46,6 +49,9 @@ func init() {
 			extension.TaskList,
 			highlighting.NewHighlighting(
 				highlighting.WithStyle("github"),
+				highlighting.WithFormatOptions(
+					chromahtml.WithClasses(true),
+				),
 			),
 		),
 		goldmark.WithParserOptions(
@@ -87,6 +93,7 @@ func run() error {
 			mu.Lock()
 			content = data
 			filePath = ""
+			lastModified = time.Now()
 			mu.Unlock()
 		} else {
 			fmt.Fprintf(os.Stderr, "Usage: mdview <file.md> [file2.md ...]\n")
@@ -94,12 +101,18 @@ func run() error {
 			os.Exit(1)
 		}
 	} else {
-		// Read first file (support multiple later via concatenation)
+		// Read files and track latest mod time
 		var combined []byte
+		var latestMod time.Time
 		for _, arg := range args {
 			data, err := os.ReadFile(arg)
 			if err != nil {
 				return fmt.Errorf("reading %s: %w", arg, err)
+			}
+			if info, err := os.Stat(arg); err == nil {
+				if info.ModTime().After(latestMod) {
+					latestMod = info.ModTime()
+				}
 			}
 			if len(combined) > 0 {
 				combined = append(combined, '\n', '\n')
@@ -109,6 +122,7 @@ func run() error {
 		mu.Lock()
 		filePath = args[0]
 		content = combined
+		lastModified = latestMod
 		mu.Unlock()
 	}
 
@@ -235,6 +249,12 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
 		title = filepath.Base(filePath) + " — mdview"
 	}
 
+	mu.RLock()
+	modTime := lastModified
+	mu.RUnlock()
+	modTimeStr := modTime.Format(time.RFC3339)
+	modTimeDisplay := modTime.Format("Jan 2, 2006 at 3:04:05 PM")
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html lang="en">
@@ -247,6 +267,9 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
 <body>
 <button class="theme-toggle" id="themeToggle" title="Toggle dark/light mode">🌓</button>
 <div class="container">
+<div class="last-modified" id="lastModified">
+  Last modified: <time datetime="%s">%s</time>
+</div>
 %s
 </div>
 <script>
@@ -273,21 +296,29 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
     }
   });
 
+  function formatDate(iso) {
+    const d = new Date(iso);
+    return d.toLocaleDateString(undefined, {year:'numeric',month:'short',day:'numeric'})
+      + ' at ' + d.toLocaleTimeString();
+  }
+
   // SSE live reload
   const evtSource = new EventSource('/events');
   evtSource.addEventListener('reload', function() {
-    fetch('/raw').then(r => r.text()).then(html => {
-      document.querySelector('.container').innerHTML = html;
+    fetch('/raw').then(r => r.json()).then(data => {
+      document.querySelector('.container').innerHTML = data.html;
+      const timeEl = document.querySelector('#lastModified time');
+      timeEl.setAttribute('datetime', data.lastModified);
+      timeEl.textContent = formatDate(data.lastModified);
     });
   });
   evtSource.onerror = function() {
-    // Server went away, stop retrying
     evtSource.close();
   };
 })();
 </script>
 </body>
-</html>`, title, string(css), string(rendered))
+</html>`, title, string(css), modTimeStr, modTimeDisplay, string(rendered))
 }
 
 func handleRaw(w http.ResponseWriter, r *http.Request) {
@@ -296,8 +327,15 @@ func handleRaw(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(rendered)
+	mu.RLock()
+	modTime := lastModified
+	mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"html":         string(rendered),
+		"lastModified": modTime.Format(time.RFC3339),
+	})
 }
 
 func handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -371,6 +409,7 @@ func watchFiles(ctx context.Context, paths []string) {
 			return
 		case <-ticker.C:
 			changed := false
+			var latestMod time.Time
 			for absPath, lastMod := range modTimes {
 				info, err := os.Stat(absPath)
 				if err != nil {
@@ -379,6 +418,9 @@ func watchFiles(ctx context.Context, paths []string) {
 				if info.ModTime().After(lastMod) {
 					modTimes[absPath] = info.ModTime()
 					changed = true
+				}
+				if info.ModTime().After(latestMod) {
+					latestMod = info.ModTime()
 				}
 			}
 			if changed {
@@ -396,6 +438,7 @@ func watchFiles(ctx context.Context, paths []string) {
 				}
 				mu.Lock()
 				content = combined
+				lastModified = latestMod
 				mu.Unlock()
 				notifyClients()
 			}
