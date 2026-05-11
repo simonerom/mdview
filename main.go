@@ -34,6 +34,7 @@ var (
 	md goldmark.Markdown
 
 	filePath     string
+	baseDir      string
 	content      []byte
 	lastModified time.Time
 	mu           sync.RWMutex
@@ -119,8 +120,13 @@ func run() error {
 			}
 			combined = append(combined, data...)
 		}
+		absFirst, err := filepath.Abs(args[0])
+		if err != nil {
+			return fmt.Errorf("resolving %s: %w", args[0], err)
+		}
 		mu.Lock()
 		filePath = args[0]
+		baseDir = filepath.Dir(absFirst)
 		content = combined
 		lastModified = latestMod
 		mu.Unlock()
@@ -169,47 +175,12 @@ func run() error {
 		go watchFiles(ctx, args)
 	}
 
-	// Wait for shutdown signal or all clients disconnecting
-	disconnectCh := make(chan struct{})
-	go func() {
-		// Wait for at least one client to connect, then watch for all disconnects
-		for {
-			time.Sleep(500 * time.Millisecond)
-			clientsMu.Lock()
-			count := len(clients)
-			clientsMu.Unlock()
-			if count > 0 {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-		}
-		// Now wait for all clients to disconnect
-		for {
-			time.Sleep(500 * time.Millisecond)
-			clientsMu.Lock()
-			count := len(clients)
-			clientsMu.Unlock()
-			if count == 0 {
-				close(disconnectCh)
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-		}
-	}()
-
+	// Wait for shutdown signal. The server runs until the user stops it
+	// (Ctrl+C) — we don't auto-shutdown on SSE disconnects, because every
+	// in-page navigation closes the SSE connection.
 	select {
 	case <-sigCh:
 		fmt.Fprintf(os.Stderr, "\nShutting down...\n")
-	case <-disconnectCh:
-		fmt.Fprintf(os.Stderr, "Browser disconnected, shutting down...\n")
 	case <-ctx.Done():
 	}
 
@@ -231,29 +202,96 @@ func renderMarkdown() ([]byte, error) {
 }
 
 func handlePage(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if r.URL.Path == "/" {
+		rendered, err := renderMarkdown()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		mu.RLock()
+		modTime := lastModified
+		name := filePath
+		mu.RUnlock()
+		writePage(w, name, rendered, modTime, true)
+		return
+	}
+
+	// Serve files from baseDir (set when launched with file args).
+	if baseDir == "" {
 		http.NotFound(w, r)
 		return
 	}
 
-	rendered, err := renderMarkdown()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	// Resolve and validate the requested path stays within baseDir.
+	rel := strings.TrimPrefix(r.URL.Path, "/")
+	cleaned := filepath.Clean(rel)
+	if cleaned == "." || strings.HasPrefix(cleaned, "..") || filepath.IsAbs(cleaned) {
+		http.NotFound(w, r)
+		return
+	}
+	absPath := filepath.Join(baseDir, cleaned)
+	// Defense in depth: re-check containment after Join.
+	if !strings.HasPrefix(absPath, baseDir+string(filepath.Separator)) && absPath != baseDir {
+		http.NotFound(w, r)
 		return
 	}
 
+	info, err := os.Stat(absPath)
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(absPath))
+	if ext == ".md" || ext == ".markdown" {
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var buf bytes.Buffer
+		if err := md.Convert(data, &buf); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writePage(w, absPath, buf.Bytes(), info.ModTime(), false)
+		return
+	}
+
+	// Serve other files as static assets (images, etc.).
+	http.ServeFile(w, r, absPath)
+}
+
+// writePage writes the full HTML page. liveReload controls whether the SSE
+// reload script is included — only the initially-loaded file is watched.
+func writePage(w http.ResponseWriter, name string, rendered []byte, modTime time.Time, liveReload bool) {
 	css, _ := styleFS.ReadFile("style.css")
 
 	title := "mdview"
-	if filePath != "" {
-		title = filepath.Base(filePath) + " — mdview"
+	if name != "" {
+		title = filepath.Base(name) + " — mdview"
 	}
 
-	mu.RLock()
-	modTime := lastModified
-	mu.RUnlock()
 	modTimeStr := modTime.Format(time.RFC3339)
 	modTimeDisplay := modTime.Format("Jan 2, 2006 at 3:04:05 PM")
+
+	reloadScript := ""
+	if liveReload {
+		reloadScript = `
+  // SSE live reload
+  const evtSource = new EventSource('/events');
+  evtSource.addEventListener('reload', function() {
+    fetch('/raw').then(r => r.json()).then(data => {
+      document.querySelector('.container').innerHTML = data.html;
+      const timeEl = document.querySelector('#lastModified time');
+      timeEl.setAttribute('datetime', data.lastModified);
+      timeEl.textContent = formatDate(data.lastModified);
+    });
+  });
+  evtSource.onerror = function() {
+    evtSource.close();
+  };`
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html>
@@ -301,24 +339,11 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
     return d.toLocaleDateString(undefined, {year:'numeric',month:'short',day:'numeric'})
       + ' at ' + d.toLocaleTimeString();
   }
-
-  // SSE live reload
-  const evtSource = new EventSource('/events');
-  evtSource.addEventListener('reload', function() {
-    fetch('/raw').then(r => r.json()).then(data => {
-      document.querySelector('.container').innerHTML = data.html;
-      const timeEl = document.querySelector('#lastModified time');
-      timeEl.setAttribute('datetime', data.lastModified);
-      timeEl.textContent = formatDate(data.lastModified);
-    });
-  });
-  evtSource.onerror = function() {
-    evtSource.close();
-  };
+%s
 })();
 </script>
 </body>
-</html>`, title, string(css), modTimeStr, modTimeDisplay, string(rendered))
+</html>`, title, string(css), modTimeStr, modTimeDisplay, string(rendered), reloadScript)
 }
 
 func handleRaw(w http.ResponseWriter, r *http.Request) {
